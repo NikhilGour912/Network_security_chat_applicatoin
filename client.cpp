@@ -1,556 +1,178 @@
-#include "crypto.h"
-#include "dh_group.h"
 
+#include <openssl/bn.h>
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+#include <openssl/sha.h>
+#include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
-#include <sys/socket.h>
 #include <unistd.h>
-
+#include <cstring>
 #include <iostream>
-#include <sstream>
 #include <string>
-#include <thread>
 #include <vector>
+#include <mutex>
+#include <thread>
+#include <atomic>
+#include <sstream>
+#include <iomanip>
+#include <algorithm>
 
-bool send_all(int fd, const std::string& data)
-{
-    size_t sent = 0;
+static const char *GROUP14_P =
+"FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1"
+"29024E088A67CC74020BBEA63B139B22514A08798E3404DD"
+"EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245"
+"E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED"
+"EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE65381"
+"FFFFFFFFFFFFFFFF";
 
-    while (sent < data.size())
-    {
-        ssize_t n = send(fd, data.data() + sent,
-                         data.size() - sent, 0);
-
-        if (n <= 0)
-            return false;
-
-        sent += static_cast<size_t>(n);
+static std::string hex_of(const unsigned char *p, size_t n) {
+    std::ostringstream o;
+    for (size_t i=0;i<n;i++) o << std::hex << std::setw(2) << std::setfill('0') << (int)p[i];
+    return o.str();
+}
+static std::vector<unsigned char> unhex(const std::string &s) {
+    std::vector<unsigned char> out;
+    if (s.size()%2) return {};
+    for(size_t i=0;i<s.size();i+=2) out.push_back((unsigned char)std::stoul(s.substr(i,2),nullptr,16));
+    return out;
+}
+static std::string b64(const unsigned char *p, int n) {
+    std::string out(4*((n+2)/3), '\0');
+    int m=EVP_EncodeBlock((unsigned char*)out.data(),p,n);
+    out.resize(m); return out;
+}
+static std::vector<unsigned char> unb64(const std::string &s) {
+    std::vector<unsigned char> out((s.size()*3)/4+4);
+    int n=EVP_DecodeBlock(out.data(),(const unsigned char*)s.data(),(int)s.size());
+    if(n<0) return {};
+    int pad=0; if(!s.empty()&&s.back()=='=') pad++; if(s.size()>1&&s[s.size()-2]=='=') pad++;
+    out.resize(n-pad); return out;
+}
+static std::string recv_line(int fd, size_t maxlen=1024*1024) {
+    std::string s; char c;
+    while(s.size()<maxlen) {
+        ssize_t n=recv(fd,&c,1,0);
+        if(n<=0) return {};
+        if(c=='\n') return s;
+        s.push_back(c);
     }
-
+    return {};
+}
+static bool send_all(int fd,const std::string &s) {
+    size_t off=0; while(off<s.size()) {
+        ssize_t n=send(fd,s.data()+off,s.size()-off,MSG_NOSIGNAL);
+        if(n<=0) return false; off+=n;
+    }
     return true;
 }
+static BIGNUM *bn_from_hex(const char *s) { BIGNUM *x=nullptr; BN_hex2bn(&x,s); return x; }
 
-bool send_line(int fd, const std::string& line)
-{
-    return send_all(fd, line + "\n");
+static bool dh_make(BIGNUM *p, BIGNUM *g, BIGNUM **priv, BIGNUM **pub) {
+    *priv=BN_new(); *pub=BN_new(); BN_CTX *ctx=BN_CTX_new();
+    if(!*priv||!*pub||!ctx) return false;
+    if(!BN_priv_rand(*priv,BN_num_bits(p)-1,BN_RAND_TOP_TWO,BN_RAND_BOTTOM_ANY)) return false;
+    if(!BN_mod_exp(*pub,g,*priv,p,ctx)) return false;
+    BN_CTX_free(ctx); return true;
 }
-
-bool receive_line(int fd, std::string& line)
-{
-    line.clear();
-    char c;
-
-    while (true)
-    {
-        ssize_t n = recv(fd, &c, 1, 0);
-
-        if (n <= 0)
-            return false;
-
-        if (c == '\n')
-            return true;
-
-        if (c != '\r')
-            line.push_back(c);
-
-        if (line.size() > 1024 * 1024)
-            return false;
-    }
+static BIGNUM *dh_shared(const BIGNUM *peer,const BIGNUM *priv,const BIGNUM *p) {
+    BIGNUM *s=BN_new(); BN_CTX *ctx=BN_CTX_new();
+    if(!s||!ctx) { BN_free(s); BN_CTX_free(ctx); return nullptr; }
+    if(!BN_mod_exp(s,peer,priv,p,ctx)) { BN_free(s); s=nullptr; }
+    BN_CTX_free(ctx); return s;
 }
-
-bool send_encrypted(
-    int fd,
-    const std::vector<unsigned char>& key,
-    const std::string& plaintext)
-{
-    std::vector<unsigned char> ciphertext;
-
-    if (!aes_gcm_encrypt(key, plaintext, ciphertext))
-        return false;
-
-    return send_line(
-        fd,
-        "ENC|" + base64_encode(ciphertext)
-    );
+static std::vector<unsigned char> derive_key(const BIGNUM *secret) {
+    int n=BN_num_bytes(secret); std::vector<unsigned char> raw(n);
+    BN_bn2bin(secret,raw.data());
+    unsigned char h[SHA256_DIGEST_LENGTH]; SHA256(raw.data(),raw.size(),h);
+    return std::vector<unsigned char>(h,h+32);
 }
-
-bool receive_encrypted(
-    int fd,
-    const std::vector<unsigned char>& key,
-    std::string& plaintext)
-{
-    std::string line;
-
-    if (!receive_line(fd, line))
-        return false;
-
-    if (line.rfind("ENC|", 0) != 0)
-        return false;
-
-    std::vector<unsigned char> ciphertext;
-
-    if (!base64_decode(line.substr(4), ciphertext))
-        return false;
-
-    if (!aes_gcm_decrypt(key, ciphertext, plaintext))
-    {
-        std::cerr
-            << "\n[Client] AES-GCM authentication/decryption failed.\n";
-        return false;
-    }
-
-    return true;
+static std::string fingerprint(const std::vector<unsigned char>& key) {
+    unsigned char h[SHA256_DIGEST_LENGTH]; SHA256(key.data(),key.size(),h);
+    return hex_of(h,32);
 }
-
-void receiver_thread(
-    int fd,
-    std::vector<unsigned char> key)
-{
-    while (true)
-    {
-        std::string message;
-
-        if (!receive_encrypted(fd, key, message))
-        {
-            std::cout << "\n[Client] Connection closed.\n";
-            return;
-        }
-
-        if (message.rfind("FROM|", 0) == 0)
-        {
-            std::string rest = message.substr(5);
-            size_t separator = rest.find('|');
-
-            if (separator != std::string::npos)
-            {
-                std::string sender =
-                    rest.substr(0, separator);
-
-                std::string text =
-                    rest.substr(separator + 1);
-
-                std::cout << "\n[" << sender << "] "
-                          << text << "\n> ";
-                std::cout.flush();
-            }
-
-            continue;
-        }
-
-        if (message.rfind("USERS", 0) == 0)
-        {
-            std::cout << "\n[Online users]\n";
-
-            std::string rest = message.substr(5);
-
-            if (!rest.empty() && rest[0] == '|')
-                rest.erase(0, 1);
-
-            std::stringstream ss(rest);
-            std::string user;
-
-            while (std::getline(ss, user, '|'))
-            {
-                if (!user.empty())
-                    std::cout << "  " << user << "\n";
-            }
-
-            std::cout << "> ";
-            std::cout.flush();
-            continue;
-        }
-
-        if (message == "OK|Connected")
-        {
-            std::cout << "[Client] Login successful.\n";
-            continue;
-        }
-
-        if (message == "BYE")
-        {
-            std::cout << "\n[Client] Server closed the session.\n";
-            return;
-        }
-
-        if (message.rfind("ERROR|", 0) == 0)
-        {
-            std::cout << "\n[Server Error] "
-                      << message.substr(6)
-                      << "\n> ";
-            std::cout.flush();
-            continue;
-        }
-    }
+static std::string gcm_encrypt(const std::vector<unsigned char>& key,const std::string& plain) {
+    unsigned char nonce[12]; if(RAND_bytes(nonce,12)!=1) return {};
+    EVP_CIPHER_CTX *c=EVP_CIPHER_CTX_new(); if(!c) return {};
+    std::vector<unsigned char> ct(plain.size()+16); int l1=0,l2=0;
+    bool ok=EVP_EncryptInit_ex(c,EVP_aes_256_gcm(),nullptr,nullptr,nullptr)==1;
+    ok=ok&&EVP_CIPHER_CTX_ctrl(c,EVP_CTRL_GCM_SET_IVLEN,12,nullptr)==1;
+    ok=ok&&EVP_EncryptInit_ex(c,nullptr,nullptr,key.data(),nonce)==1;
+    ok=ok&&EVP_EncryptUpdate(c,ct.data(),&l1,(const unsigned char*)plain.data(),(int)plain.size())==1;
+    ok=ok&&EVP_EncryptFinal_ex(c,ct.data()+l1,&l2)==1;
+    unsigned char tag[16]; ok=ok&&EVP_CIPHER_CTX_ctrl(c,EVP_CTRL_GCM_GET_TAG,16,tag)==1;
+    EVP_CIPHER_CTX_free(c); if(!ok) return {};
+    std::vector<unsigned char> wire(nonce,nonce+12);
+    wire.insert(wire.end(),ct.begin(),ct.begin()+l1+l2); wire.insert(wire.end(),tag,tag+16);
+    return "ENC|"+b64(wire.data(),(int)wire.size());
 }
-
-bool perform_dh_handshake(
-    int fd,
-    std::vector<unsigned char>& aes_key)
-{
-    std::string line;
-
-    if (!receive_line(fd, line) ||
-        line.rfind("DH_P|", 0) != 0)
-        return false;
-
-    BIGNUM* p = hex_to_bn(line.substr(5));
-
-    if (!p)
-        return false;
-
-    if (!receive_line(fd, line) ||
-        line.rfind("DH_G|", 0) != 0)
-    {
-        BN_free(p);
-        return false;
-    }
-
-    BIGNUM* g = hex_to_bn(line.substr(5));
-
-    if (!g)
-    {
-        BN_free(p);
-        return false;
-    }
-
-    if (!receive_line(fd, line) ||
-        line.rfind("DH_PUB|", 0) != 0)
-    {
-        BN_free(p);
-        BN_free(g);
-        return false;
-    }
-
-    BIGNUM* server_public =
-        hex_to_bn(line.substr(7));
-
-    if (!server_public)
-    {
-        BN_free(p);
-        BN_free(g);
-        return false;
-    }
-
-    /*
-     * The client expects the standard published group.
-     * This prevents a malicious peer from silently replacing
-     * the configured DH group.
-     */
-    BIGNUM* expected_p = hex_to_bn(DH_GROUP14_P);
-    BIGNUM* expected_g = hex_to_bn(DH_GROUP14_G);
-
-    bool expected_group =
-        expected_p && expected_g &&
-        BN_cmp(p, expected_p) == 0 &&
-        BN_cmp(g, expected_g) == 0;
-
-    BN_free(expected_p);
-    BN_free(expected_g);
-
-    if (!expected_group)
-    {
-        std::cerr << "[Client] Unexpected DH group.\n";
-
-        BN_free(p);
-        BN_free(g);
-        BN_free(server_public);
-        return false;
-    }
-
-    if (BN_is_zero(server_public) ||
-        BN_is_one(server_public) ||
-        BN_cmp(server_public, p) >= 0)
-    {
-        std::cerr << "[Client] Invalid server DH public value.\n";
-
-        BN_free(p);
-        BN_free(g);
-        BN_free(server_public);
-        return false;
-    }
-
-    BIGNUM* private_key =
-        generate_private_key(p);
-
-    BIGNUM* public_key =
-        compute_public_key(
-            g,
-            private_key,
-            p
-        );
-
-    if (!private_key || !public_key)
-    {
-        BN_free(p);
-        BN_free(g);
-        BN_free(server_public);
-        BN_free(private_key);
-        BN_free(public_key);
-        return false;
-    }
-
-    if (!send_line(
-            fd,
-            "DH_CLIENT_PUB|" + bn_to_hex(public_key)))
-    {
-        BN_free(p);
-        BN_free(g);
-        BN_free(server_public);
-        BN_free(private_key);
-        BN_free(public_key);
-        return false;
-    }
-
-    BIGNUM* shared_secret =
-        compute_shared_secret(
-            server_public,
-            private_key,
-            p
-        );
-
-    if (!shared_secret || BN_is_zero(shared_secret))
-    {
-        BN_free(p);
-        BN_free(g);
-        BN_free(server_public);
-        BN_free(private_key);
-        BN_free(public_key);
-        BN_free(shared_secret);
-        return false;
-    }
-
-    aes_key = derive_aes_key(shared_secret);
-
-    std::cout
-        << "[Client] DH fingerprint: "
-        << fingerprint(shared_secret)
-        << "\n";
-
-    if (!receive_line(fd, line) || line != "DH_OK")
-    {
-        BN_free(p);
-        BN_free(g);
-        BN_free(server_public);
-        BN_free(private_key);
-        BN_free(public_key);
-        BN_free(shared_secret);
-        return false;
-    }
-
-    std::cout << "[Client] DH handshake completed.\n";
-
-    BN_free(p);
-    BN_free(g);
-    BN_free(server_public);
-    BN_free(private_key);
-    BN_free(public_key);
-    BN_free(shared_secret);
-
-    return true;
+static bool gcm_decrypt(const std::vector<unsigned char>& key,const std::string& msg,std::string& plain) {
+    if(msg.rfind("ENC|",0)!=0) return false;
+    auto w=unb64(msg.substr(4)); if(w.size()<28) return false;
+    const unsigned char *nonce=w.data(), *tag=w.data()+w.size()-16, *ct=w.data()+12;
+    int ctlen=(int)w.size()-28, l1=0,l2=0; std::vector<unsigned char> pt(ctlen+1);
+    EVP_CIPHER_CTX *c=EVP_CIPHER_CTX_new(); if(!c) return false;
+    bool ok=EVP_DecryptInit_ex(c,EVP_aes_256_gcm(),nullptr,nullptr,nullptr)==1;
+    ok=ok&&EVP_CIPHER_CTX_ctrl(c,EVP_CTRL_GCM_SET_IVLEN,12,nullptr)==1;
+    ok=ok&&EVP_DecryptInit_ex(c,nullptr,nullptr,key.data(),nonce)==1;
+    ok=ok&&EVP_DecryptUpdate(c,pt.data(),&l1,ct,ctlen)==1;
+    ok=ok&&EVP_CIPHER_CTX_ctrl(c,EVP_CTRL_GCM_SET_TAG,16,(void*)tag)==1;
+    ok=ok&&EVP_DecryptFinal_ex(c,pt.data()+l1,&l2)==1;
+    EVP_CIPHER_CTX_free(c); if(!ok) return false;
+    plain.assign((char*)pt.data(),l1+l2); return true;
 }
+static void free_bn(BIGNUM *&x){ BN_free(x); x=nullptr; }
 
-int connect_to_server(
-    const std::string& ip,
-    int port)
-{
-    int fd = socket(
-        AF_INET,
-        SOCK_STREAM,
-        0
-    );
-
-    if (fd < 0)
-    {
-        perror("socket");
-        return -1;
-    }
-
-    sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_port = htons(port);
-
-    if (inet_pton(
-            AF_INET,
-            ip.c_str(),
-            &address.sin_addr) != 1)
-    {
-        std::cerr << "Invalid IPv4 address.\n";
-        close(fd);
-        return -1;
-    }
-
-    if (connect(
-            fd,
-            reinterpret_cast<sockaddr*>(&address),
-            sizeof(address)) < 0)
-    {
-        perror("connect");
-        close(fd);
-        return -1;
-    }
-
+static int connect_to(const std::string& ip,int port){
+    int fd=socket(AF_INET,SOCK_STREAM,0); if(fd<0) return -1;
+    sockaddr_in a{}; a.sin_family=AF_INET; a.sin_port=htons(port);
+    if(inet_pton(AF_INET,ip.c_str(),&a.sin_addr)!=1 || connect(fd,(sockaddr*)&a,sizeof(a))<0){close(fd);return -1;}
     return fd;
 }
-
-int main(int argc, char* argv[])
-{
-    if (argc != 3 && argc != 4)
-    {
-        std::cout
-            << "Usage: ./client <server-ip> <username> [port]\n";
-        return 1;
+int main(int argc,char**argv){
+    if(argc<3||argc>4){std::cerr<<"Usage: "<<argv[0]<<" <server-ip> <username> [port]\n";return 1;}
+    std::string host=argv[1], user=argv[2]; int port=argc==4?std::stoi(argv[3]):5000;
+    int fd=connect_to(host,port); if(fd<0){perror("connect");return 1;}
+    BIGNUM *p=bn_from_hex(GROUP14_P), *g=BN_new(), *priv=nullptr,*pub=nullptr,*peer=nullptr,*secret=nullptr;
+    BN_set_word(g,2); dh_make(p,g,&priv,&pub);
+    if(!send_all(fd,"DH_P|"+GROUP14_P+"\n")||!send_all(fd,"DH_G|2\n")||!send_all(fd,"DH_PUB|"+std::string(BN_bn2hex(pub))+"\n")) {close(fd);return 1;}
+    std::string line=recv_line(fd); if(line.rfind("DH_PUB|",0)!=0){std::cerr<<"DH handshake failed\n";return 1;}
+    peer=bn_from_hex(line.substr(7).c_str());
+    if(BN_cmp(peer,BN_value_one())<=0||BN_cmp(peer,p)>=0){std::cerr<<"Invalid DH public value\n";return 1;}
+    secret=dh_shared(peer,priv,p); auto key=derive_key(secret);
+    std::cout<<"[DH] shared-secret fingerprint: "<<fingerprint(key)<<"\n";
+    if(!send_all(fd,"DH_OK\n")) return 1;
+    std::string enc=gcm_encrypt(key,"LOGIN|"+user); if(enc.empty()||!send_all(fd,enc+"\n")) return 1;
+    std::string selected; std::atomic<bool> alive{true}; std::mutex out;
+    std::thread rx([&](){
+        while(alive){
+            std::string w=recv_line(fd); if(w.empty()){alive=false;break;}
+            std::string plain;
+            if(!gcm_decrypt(key,w,plain)){std::lock_guard<std::mutex>lk(out);std::cerr<<"[SECURITY] Authentication/decryption failure; message discarded.\n";continue;}
+            if(plain.rfind("FROM|",0)==0){
+                size_t a=plain.find('|',5); if(a!=std::string::npos){
+                    std::string from=plain.substr(5,a-5), text=plain.substr(a+1);
+                    std::lock_guard<std::mutex>lk(out); std::cout<<"["<<from<<"] "<<text<<"\n";
+                }
+            } else if(plain.rfind("USERS|",0)==0){
+                std::lock_guard<std::mutex>lk(out); std::cout<<"[online] "<<plain.substr(6)<<"\n";
+            } else { std::lock_guard<std::mutex>lk(out); std::cout<<"[server] "<<plain<<"\n"; if(plain=="BYE") alive=false; }
+        }
+    });
+    std::cout<<"[Connected as "<<user<<"]\nCommands: @username message | /chat username | /who | /quit\n";
+    std::string input;
+    while(alive && std::getline(std::cin,input)){
+        if(input=="/quit"){auto e=gcm_encrypt(key,"QUIT");send_all(fd,e+"\n");break;}
+        if(input=="/who"){auto e=gcm_encrypt(key,"WHO");send_all(fd,e+"\n");continue;}
+        if(input.rfind("/chat ",0)==0){selected=input.substr(6);std::cout<<"[chat] selected "<<selected<<"\n";continue;}
+        std::string to,text;
+        if(input.rfind("@",0)==0){
+            size_t sp=input.find(' '); if(sp==std::string::npos){std::cout<<"Usage: @username message\n";continue;}
+            to=input.substr(1,sp-1); text=input.substr(sp+1); selected=to;
+        } else { if(selected.empty()){std::cout<<"Select a user with /chat username or @username message\n";continue;} to=selected;text=input; }
+        if(to.empty()||text.empty()) continue;
+        auto e=gcm_encrypt(key,"MSG|"+to+"|"+text); if(e.empty()||!send_all(fd,e+"\n")) break;
     }
-
-    std::string server_ip = argv[1];
-    std::string username = argv[2];
-
-    int port = 5000;
-
-    if (argc == 4)
-        port = std::stoi(argv[3]);
-
-    int fd = connect_to_server(server_ip, port);
-
-    if (fd < 0)
-        return 1;
-
-    std::cout << "====================================\n";
-    std::cout << "       Phase 2 Secure Client\n";
-    std::cout << "====================================\n";
-
-    std::vector<unsigned char> aes_key;
-
-    if (!perform_dh_handshake(fd, aes_key))
-    {
-        std::cerr << "[Client] DH handshake failed.\n";
-        close(fd);
-        return 1;
-    }
-
-    if (!send_encrypted(
-            fd,
-            aes_key,
-            "LOGIN|" + username))
-    {
-        close(fd);
-        return 1;
-    }
-
-    std::thread receiver(
-        receiver_thread,
-        fd,
-        aes_key
-    );
-
-    receiver.detach();
-
-    std::string current_partner;
-
-    std::cout << "\nCommands:\n";
-    std::cout << "  @username message\n";
-    std::cout << "  /chat username\n";
-    std::cout << "  /who\n";
-    std::cout << "  /quit\n\n";
-
-    while (true)
-    {
-        std::cout << "> ";
-        std::cout.flush();
-
-        std::string input;
-
-        if (!std::getline(std::cin, input))
-            break;
-
-        if (input.empty())
-            continue;
-
-        if (input == "/quit")
-        {
-            send_encrypted(fd, aes_key, "QUIT");
-            break;
-        }
-
-        if (input == "/who")
-        {
-            send_encrypted(fd, aes_key, "WHO");
-            continue;
-        }
-
-        if (input.rfind("/chat ", 0) == 0)
-        {
-            std::string partner = input.substr(6);
-
-            if (partner.empty())
-            {
-                std::cout << "Usage: /chat username\n";
-                continue;
-            }
-
-            current_partner = partner;
-
-            std::cout
-                << "[Current chat partner: "
-                << current_partner
-                << "]\n";
-
-            continue;
-        }
-
-        if (input[0] == '@')
-        {
-            size_t space = input.find(' ');
-
-            if (space == std::string::npos)
-            {
-                std::cout
-                    << "Usage: @username message\n";
-                continue;
-            }
-
-            std::string recipient =
-                input.substr(1, space - 1);
-
-            std::string text =
-                input.substr(space + 1);
-
-            if (recipient.empty() || text.empty())
-            {
-                std::cout
-                    << "Usage: @username message\n";
-                continue;
-            }
-
-            current_partner = recipient;
-
-            send_encrypted(
-                fd,
-                aes_key,
-                "MSG|" + recipient + "|" + text
-            );
-
-            continue;
-        }
-
-        /*
-         * Anything that is not a recognized command is a normal
-         * chat message to the currently selected partner.
-         */
-        if (current_partner.empty())
-        {
-            std::cout
-                << "No chat partner selected. "
-                << "Use @username message or /chat username.\n";
-            continue;
-        }
-
-        send_encrypted(
-            fd,
-            aes_key,
-            "MSG|" + current_partner + "|" + input
-        );
-    }
-
-    close(fd);
-    return 0;
+    alive=false; shutdown(fd,SHUT_RDWR); close(fd); if(rx.joinable())rx.join();
+    free_bn(p);free_bn(g);free_bn(priv);free_bn(pub);free_bn(peer);free_bn(secret); return 0;
 }
