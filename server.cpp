@@ -1,569 +1,496 @@
+#include "crypto.h"
+#include "dh_group.h"
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <thread>
-#include <mutex>
-#include <unordered_map>
-#include <sstream>
 #include <vector>
 
-#include <cstring>
-#include <unistd.h>
-#include <arpa/inet.h>
-#include <sys/socket.h>
+constexpr int PORT = 5000;
+constexpr int MAX_CLIENTS = 2;
 
-using namespace std;
+struct Client {
+    int socket = -1;
+    int slot = -1;
+    std::string username;
+    std::vector<unsigned char> aes_key;
+    bool authenticated = false;
+};
 
-const int PORT = 5000;
-const int MAX_CLIENTS = 2;
+Client* clients[MAX_CLIENTS] = {nullptr, nullptr};
+std::mutex clients_mutex;
 
-// username -> socket
-unordered_map<string, int> clients;
-
-mutex clients_mutex;
-
-// Separate mutex for each client's socket.
-// This prevents two server threads from writing to
-// the same socket at the same time.
-mutex send_mutexes[MAX_CLIENTS];
-
-
-// --------------------------------------------------
-// Send a complete line
-// --------------------------------------------------
-
-bool send_line(int socket_fd, int client_id, const string& message)
+bool send_all(int fd, const std::string& data)
 {
-    string data = message + "\n";
+    size_t sent = 0;
 
-    lock_guard<mutex> lock(send_mutexes[client_id]);
-
-    size_t total_sent = 0;
-
-    while (total_sent < data.size())
+    while (sent < data.size())
     {
-        int bytes_sent = send(
-            socket_fd,
-            data.c_str() + total_sent,
-            data.size() - total_sent,
-            0
-        );
+        ssize_t n = send(fd, data.data() + sent,
+                         data.size() - sent, 0);
 
-        if (bytes_sent <= 0)
+        if (n <= 0)
             return false;
 
-        total_sent += bytes_sent;
+        sent += static_cast<size_t>(n);
     }
 
     return true;
 }
 
+bool send_line(int fd, const std::string& line)
+{
+    return send_all(fd, line + "\n");
+}
 
-// --------------------------------------------------
-// Receive exactly one line from TCP stream
-// --------------------------------------------------
-
-bool receive_line(int socket_fd, string& line)
+bool receive_line(int fd, std::string& line)
 {
     line.clear();
-
-    char ch;
+    char c;
 
     while (true)
     {
-        int bytes_received = recv(
-            socket_fd,
-            &ch,
-            1,
-            0
-        );
+        ssize_t n = recv(fd, &c, 1, 0);
 
-        if (bytes_received <= 0)
+        if (n <= 0)
             return false;
 
-        if (ch == '\n')
-            break;
+        if (c == '\n')
+            return true;
 
-        if (ch != '\r')
-            line += ch;
+        if (c != '\r')
+            line.push_back(c);
+
+        if (line.size() > 1024 * 1024)
+            return false;
     }
+}
+
+bool send_encrypted(Client* client, const std::string& plaintext)
+{
+    std::vector<unsigned char> ciphertext;
+
+    if (!aes_gcm_encrypt(client->aes_key, plaintext, ciphertext))
+        return false;
+
+    return send_line(
+        client->socket,
+        "ENC|" + base64_encode(ciphertext)
+    );
+}
+
+bool receive_encrypted(Client* client, std::string& plaintext)
+{
+    std::string line;
+
+    if (!receive_line(client->socket, line))
+        return false;
+
+    if (line.rfind("ENC|", 0) != 0)
+        return false;
+
+    std::vector<unsigned char> ciphertext;
+
+    if (!base64_decode(line.substr(4), ciphertext))
+        return false;
+
+    return aes_gcm_decrypt(
+        client->aes_key,
+        ciphertext,
+        plaintext
+    );
+}
+
+Client* find_user(const std::string& username)
+{
+    std::lock_guard<std::mutex> lock(clients_mutex);
+
+    for (int i = 0; i < MAX_CLIENTS; ++i)
+    {
+        if (clients[i] &&
+            clients[i]->authenticated &&
+            clients[i]->username == username)
+        {
+            return clients[i];
+        }
+    }
+
+    return nullptr;
+}
+
+void remove_client(Client* client)
+{
+    std::lock_guard<std::mutex> lock(clients_mutex);
+
+    if (client->slot >= 0 &&
+        client->slot < MAX_CLIENTS &&
+        clients[client->slot] == client)
+    {
+        clients[client->slot] = nullptr;
+    }
+}
+
+void send_who(Client* requester)
+{
+    std::string message = "USERS";
+
+    std::lock_guard<std::mutex> lock(clients_mutex);
+
+    for (int i = 0; i < MAX_CLIENTS; ++i)
+    {
+        if (clients[i] && clients[i]->authenticated)
+            message += "|" + clients[i]->username;
+    }
+
+    send_encrypted(requester, message);
+}
+
+bool perform_dh_handshake(Client* client)
+{
+    BIGNUM* p = hex_to_bn(DH_GROUP14_P);
+    BIGNUM* g = hex_to_bn(DH_GROUP14_G);
+
+    BIGNUM* private_key = nullptr;
+    BIGNUM* public_key = nullptr;
+    BIGNUM* client_public = nullptr;
+    BIGNUM* shared_secret = nullptr;
+
+    if (!p || !g)
+        goto fail;
+
+    private_key = generate_private_key(p);
+    if (!private_key)
+        goto fail;
+
+    public_key = compute_public_key(g, private_key, p);
+    if (!public_key)
+        goto fail;
+
+    if (!send_line(client->socket, "DH_P|" + bn_to_hex(p)))
+        goto fail;
+
+    if (!send_line(client->socket, "DH_G|" + bn_to_hex(g)))
+        goto fail;
+
+    if (!send_line(client->socket, "DH_PUB|" + bn_to_hex(public_key)))
+        goto fail;
+
+    {
+        std::string line;
+
+        if (!receive_line(client->socket, line))
+            goto fail;
+
+        const std::string prefix = "DH_CLIENT_PUB|";
+
+        if (line.rfind(prefix, 0) != 0)
+            goto fail;
+
+        client_public = hex_to_bn(line.substr(prefix.size()));
+
+        if (!client_public)
+            goto fail;
+    }
+
+    /*
+     * Basic public-value validation.
+     * Reject values outside the valid group interval.
+     */
+    if (BN_is_zero(client_public) ||
+        BN_is_one(client_public) ||
+        BN_cmp(client_public, p) >= 0)
+        goto fail;
+
+    shared_secret =
+        compute_shared_secret(client_public, private_key, p);
+
+    if (!shared_secret || BN_is_zero(shared_secret))
+        goto fail;
+
+    client->aes_key = derive_aes_key(shared_secret);
+
+    if (client->aes_key.size() != 32)
+        goto fail;
+
+    std::cout
+        << "[Server] Client " << client->slot
+        << " DH fingerprint: "
+        << fingerprint(shared_secret)
+        << "\n";
+
+    if (!send_line(client->socket, "DH_OK"))
+        goto fail;
+
+    BN_free(p);
+    BN_free(g);
+    BN_free(private_key);
+    BN_free(public_key);
+    BN_free(client_public);
+    BN_free(shared_secret);
 
     return true;
+
+fail:
+    BN_free(p);
+    BN_free(g);
+    BN_free(private_key);
+    BN_free(public_key);
+    BN_free(client_public);
+    BN_free(shared_secret);
+    return false;
 }
 
-
-// --------------------------------------------------
-// Send current online users
-// --------------------------------------------------
-
-void send_online_users(
-    int client_socket,
-    int client_id
-)
+void handle_client(Client* client)
 {
-    lock_guard<mutex> lock(clients_mutex);
+    std::cout << "[Server] Client "
+              << client->slot
+              << " connected.\n";
 
-    string response = "USERS";
-
-    for (const auto& entry : clients)
+    if (!perform_dh_handshake(client))
     {
-        response += "|" + entry.first;
-    }
-
-    send_line(
-        client_socket,
-        client_id,
-        response
-    );
-}
-
-// --------------------------------------------------
-// Remove client
-// --------------------------------------------------
-
-void remove_client(
-    const string& username
-)
-{
-    lock_guard<mutex> lock(clients_mutex);
-
-    clients.erase(username);
-}
-
-
-// --------------------------------------------------
-// Handle one client
-// --------------------------------------------------
-
-void handle_client(
-    int client_socket,
-    int client_id
-)
-{
-    string username;
-
-    // ----------------------------------------------
-    // First message must be:
-    //
-    // LOGIN|username
-    // ----------------------------------------------
-
-    string line;
-
-    if (!receive_line(client_socket, line))
-    {
-        close(client_socket);
+        std::cout << "[Server] DH handshake failed.\n";
+        close(client->socket);
+        remove_client(client);
+        delete client;
         return;
     }
 
+    std::string message;
 
-    if (line.rfind("LOGIN|", 0) != 0)
+    /*
+     * Login is encrypted too, as required by Phase 2.
+     */
+    if (!receive_encrypted(client, message) ||
+        message.rfind("LOGIN|", 0) != 0)
     {
-        send_line(
-            client_socket,
-            client_id,
-            "ERROR|First message must be LOGIN"
-        );
-
-        close(client_socket);
+        close(client->socket);
+        remove_client(client);
+        delete client;
         return;
     }
 
+    std::string username = message.substr(6);
 
-    username = line.substr(6);
-
-
-    if (username.empty())
+    if (username.empty() || username.size() > 64)
     {
-        send_line(
-            client_socket,
-            client_id,
-            "ERROR|Username cannot be empty"
-        );
-
-        close(client_socket);
+        send_encrypted(client, "ERROR|Invalid username");
+        close(client->socket);
+        remove_client(client);
+        delete client;
         return;
     }
 
-
-    // ----------------------------------------------
-    // Register username
-    // ----------------------------------------------
-
     {
-        lock_guard<mutex> lock(clients_mutex);
+        std::lock_guard<std::mutex> lock(clients_mutex);
 
-        if (clients.size() >= MAX_CLIENTS)
+        for (int i = 0; i < MAX_CLIENTS; ++i)
         {
-            send_line(
-                client_socket,
-                client_id,
-                "ERROR|Server is full"
-            );
+            if (clients[i] &&
+                clients[i] != client &&
+                clients[i]->authenticated &&
+                clients[i]->username == username)
+            {
+                send_encrypted(
+                    client,
+                    "ERROR|Username already exists"
+                );
 
-            close(client_socket);
-            return;
+                close(client->socket);
+                clients[client->slot] = nullptr;
+                delete client;
+                return;
+            }
         }
 
-
-        if (clients.find(username) != clients.end())
-        {
-            send_line(
-                client_socket,
-                client_id,
-                "ERROR|Username already exists"
-            );
-
-            close(client_socket);
-            return;
-        }
-
-
-        clients[username] = client_socket;
+        client->username = username;
+        client->authenticated = true;
     }
 
+    std::cout << "[Server] User "
+              << client->username
+              << " logged in.\n";
 
-    cout << "[Server] "
-         << username
-         << " connected."
-         << endl;
-
-
-    send_line(
-        client_socket,
-        client_id,
-        "OK|Connected"
-    );
-
-
-    // ----------------------------------------------
-    // Main message loop
-    // ----------------------------------------------
+    send_encrypted(client, "OK|Connected");
 
     while (true)
     {
-        if (!receive_line(client_socket, line))
+        if (!receive_encrypted(client, message))
         {
-            cout << "[Server] "
-                 << username
-                 << " disconnected."
-                 << endl;
-
+            std::cout << "[Server] "
+                      << client->username
+                      << " connection lost or GCM authentication failed.\n";
             break;
         }
 
-
-        // ------------------------------------------
-        // WHO
-        // ------------------------------------------
-
-        if (line == "WHO")
+        if (message == "WHO")
         {
-            cout << "[Server] "
-                 << username
-                 << " requested online users."
-                 << endl;
-
-            send_online_users(
-                client_socket,
-                client_id
-            );
-
+            send_who(client);
             continue;
         }
 
-
-        // ------------------------------------------
-        // QUIT
-        // ------------------------------------------
-
-        if (line == "QUIT")
+        if (message == "QUIT")
         {
-            cout << "[Server] "
-                 << username
-                 << " requested disconnect."
-                 << endl;
-
-            send_line(
-                client_socket,
-                client_id,
-                "BYE"
-            );
-
+            send_encrypted(client, "BYE");
             break;
         }
 
-
-        // ------------------------------------------
-        // MESSAGE
-        //
-        // MSG|recipient|message
-        // ------------------------------------------
-
-        if (line.rfind("MSG|", 0) == 0)
+        /*
+         * Application message:
+         * MSG|recipient|text
+         */
+        if (message.rfind("MSG|", 0) == 0)
         {
-            string remaining = line.substr(4);
+            std::string rest = message.substr(4);
+            size_t separator = rest.find('|');
 
-            size_t separator = remaining.find('|');
-
-            if (separator == string::npos)
+            if (separator == std::string::npos)
             {
-                send_line(
-                    client_socket,
-                    client_id,
-                    "ERROR|Invalid message format"
-                );
-
+                send_encrypted(client, "ERROR|Invalid message");
                 continue;
             }
 
+            std::string recipient = rest.substr(0, separator);
+            std::string text = rest.substr(separator + 1);
 
-            string recipient =
-                remaining.substr(0, separator);
+            std::cout << "[Server] RELAY "
+                      << client->username
+                      << " -> "
+                      << recipient
+                      << ": "
+                      << text
+                      << "\n";
 
-            string message =
-                remaining.substr(separator + 1);
+            Client* destination = find_user(recipient);
 
-
-            // --------------------------------------
-            // Required Phase 1 verification:
-            // Server can read plaintext
-            // --------------------------------------
-
-            cout << "[Server] "
-                 << username
-                 << " -> "
-                 << recipient
-                 << ": "
-                 << message
-                 << endl;
-
-
-            // --------------------------------------
-            // Find recipient
-            // --------------------------------------
-
-            int recipient_socket = -1;
-            int recipient_id = -1;
-
+            if (!destination)
             {
-                lock_guard<mutex> lock(clients_mutex);
-
-                auto it = clients.find(recipient);
-
-                if (it != clients.end())
-                {
-                    recipient_socket = it->second;
-
-                    // Since we only support two clients,
-                    // identify the other client.
-                    //
-                    // client_id 0 -> recipient 1
-                    // client_id 1 -> recipient 0
-                    recipient_id =
-                        (client_id == 0) ? 1 : 0;
-                }
-            }
-
-
-            if (recipient_socket == -1)
-            {
-                send_line(
-                    client_socket,
-                    client_id,
+                send_encrypted(
+                    client,
                     "ERROR|User not online"
                 );
-
                 continue;
             }
 
-
-            // --------------------------------------
-            // Relay plaintext
-            // --------------------------------------
-
-            string outgoing =
-                "FROM|" + username + "|" + message;
-
-
-            send_line(
-                recipient_socket,
-                recipient_id,
-                outgoing
-            );
-
-
-            cout << "[Server] Relayed message."
-                 << endl;
+            if (!send_encrypted(
+                    destination,
+                    "FROM|" + client->username + "|" + text))
+            {
+                std::cout << "[Server] Failed to forward message.\n";
+            }
 
             continue;
         }
 
-
-        // ------------------------------------------
-        // Unknown command
-        // ------------------------------------------
-
-        send_line(
-            client_socket,
-            client_id,
-            "ERROR|Unknown request"
-        );
+        send_encrypted(client, "ERROR|Unknown command");
     }
 
-
-    // ----------------------------------------------
-    // Cleanup
-    // ----------------------------------------------
-
-    remove_client(username);
-
-    close(client_socket);
+    remove_client(client);
+    close(client->socket);
+    delete client;
 }
-
 
 int main()
 {
-    // ------------------------------------------------
-    // Create TCP socket
-    // ------------------------------------------------
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
 
-    int server_socket = socket(
-        AF_INET,
-        SOCK_STREAM,
-        0
-    );
-
-    if (server_socket < 0)
+    if (server_fd < 0)
     {
         perror("socket");
         return 1;
     }
 
-
-    // Allow immediate restart
     int opt = 1;
 
     setsockopt(
-        server_socket,
+        server_fd,
         SOL_SOCKET,
         SO_REUSEADDR,
         &opt,
         sizeof(opt)
     );
 
-
-    // ------------------------------------------------
-    // Server address
-    // ------------------------------------------------
-
-    sockaddr_in server_address{};
-
-    server_address.sin_family = AF_INET;
-    server_address.sin_addr.s_addr = INADDR_ANY;
-    server_address.sin_port = htons(PORT);
-
-
-    // ------------------------------------------------
-    // Bind
-    // ------------------------------------------------
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(PORT);
 
     if (bind(
-            server_socket,
-            (sockaddr*)&server_address,
-            sizeof(server_address)
-        ) < 0)
+            server_fd,
+            reinterpret_cast<sockaddr*>(&address),
+            sizeof(address)) < 0)
     {
         perror("bind");
-
-        close(server_socket);
-
+        close(server_fd);
         return 1;
     }
 
-
-    // ------------------------------------------------
-    // Listen
-    // ------------------------------------------------
-
-    if (listen(
-            server_socket,
-            MAX_CLIENTS
-        ) < 0)
+    if (listen(server_fd, MAX_CLIENTS) < 0)
     {
         perror("listen");
-
-        close(server_socket);
-
+        close(server_fd);
         return 1;
     }
 
+    std::cout << "====================================\n";
+    std::cout << "       Phase 2 Secure Server\n";
+    std::cout << "====================================\n";
+    std::cout << "[Server] Listening on port "
+              << PORT << "\n";
 
-    cout << "====================================" << endl;
-    cout << "        Phase 1 Chat Server         " << endl;
-    cout << "====================================" << endl;
-
-    cout << "[Server] Listening on port "
-         << PORT
-         << endl;
-
-
-    // ------------------------------------------------
-    // Accept clients
-    // ------------------------------------------------
-
-    int client_count = 0;
-
-    while (client_count < MAX_CLIENTS)
+    while (true)
     {
         sockaddr_in client_address{};
+        socklen_t client_len = sizeof(client_address);
 
-        socklen_t client_length =
-            sizeof(client_address);
-
-
-        int client_socket = accept(
-            server_socket,
-            (sockaddr*)&client_address,
-            &client_length
+        int client_fd = accept(
+            server_fd,
+            reinterpret_cast<sockaddr*>(&client_address),
+            &client_len
         );
 
-
-        if (client_socket < 0)
+        if (client_fd < 0)
         {
             perror("accept");
             continue;
         }
 
+        Client* client = new Client;
+        client->socket = client_fd;
 
-        int client_id = client_count++;
+        bool placed = false;
 
-        cout << "[Server] Connection "
-             << client_id
-             << " accepted from "
-             << inet_ntoa(client_address.sin_addr)
-             << endl;
+        {
+            std::lock_guard<std::mutex> lock(clients_mutex);
 
+            for (int i = 0; i < MAX_CLIENTS; ++i)
+            {
+                if (!clients[i])
+                {
+                    client->slot = i;
+                    clients[i] = client;
+                    placed = true;
+                    break;
+                }
+            }
+        }
 
-        thread(
-            handle_client,
-            client_socket,
-            client_id
-        ).detach();
+        if (!placed)
+        {
+            std::cout << "[Server] Server full.\n";
+            close(client_fd);
+            delete client;
+            continue;
+        }
+
+        std::thread(handle_client, client).detach();
     }
 
-
-    cout << "[Server] Maximum number of clients "
-         << "connected." << endl;
-
-
-    // Keep server alive
-    while (true)
-    {
-        sleep(1);
-    }
-
-
-    close(server_socket);
-
+    close(server_fd);
     return 0;
 }
